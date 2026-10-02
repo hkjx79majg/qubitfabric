@@ -1,8 +1,8 @@
 """Core service surface for QubitFabric.
 
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
-参数绑定委托给 :mod:`qubitfabric.circuit`，无噪声状态向量仿真、
-Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
+参数绑定委托给 :mod:`qubitfabric.circuit`，状态向量/含噪密度矩阵
+仿真、Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
 错误类型在本模块公开。
 """
 
@@ -59,19 +59,25 @@ class Service:
         values: Any = None,
         shots: Any = None,
         seed: Any = None,
+        noise: Any = None,
     ) -> dict:
-        """无噪声状态向量仿真并估计各 Pauli observable 的期望值。
+        """状态向量/含噪密度矩阵仿真并估计各 Pauli observable 的期望值。
 
         省略 ``shots`` 返回精确期望值；给出 ``shots`` 则每项独立采样并
-        返回正一/负一计数。相同输入与 ``seed`` 结果完全一致，不修改输入。
+        返回正一/负一计数。可选的 ``noise`` 描述逐门局部退极化噪声，
+        省略或概率全零时与无噪声结果一致。相同输入与 ``seed`` 结果
+        完全一致，不修改输入。
         """
-        return estimate_expectation(circuit, observables, values=values, shots=shots, seed=seed)
+        return estimate_expectation(
+            circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
+        )
 
-    def gradient(self, circuit: Any, observables: Any, values: Any = None) -> dict:
+    def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。
 
-        含义与校验语义和精确 :meth:`expectation` 一致；返回
-        ``{"qubit_count", "parameters", "results"}``，每项结果为
+        含义与校验语义和精确 :meth:`expectation` 一致；可选的 ``noise``
+        描述逐门局部退极化噪声，含噪时基准值与导数都来自含噪仿真。
+        返回 ``{"qubit_count", "parameters", "results"}``，每项结果为
         ``{"observable", "expectation", "gradients"}``。不修改输入。
         """
-        return estimate_gradient(circuit, observables, values=values)
+        return estimate_gradient(circuit, observables, values=values, noise=noise)
