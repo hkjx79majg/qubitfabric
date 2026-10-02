@@ -1,7 +1,8 @@
 """Core service surface for QubitFabric.
 
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
-参数绑定委托给 :mod:`qubitfabric.circuit`，两个错误类型在本模块公开。
+参数绑定委托给 :mod:`qubitfabric.circuit`，无噪声状态向量仿真与
+Pauli 期望值估计委托给 :mod:`qubitfabric.simulate`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -16,11 +17,13 @@ from .circuit import (
     normalize_circuit,
     simplify_circuit,
 )
+from .simulate import SimulationError, estimate_expectation
 
 __all__ = [
     "Service",
     "CircuitValidationError",
     "ParameterBindingError",
+    "SimulationError",
 ]
 
 
@@ -47,3 +50,18 @@ class Service:
     def bind(self, circuit: Any, values: Any) -> dict:
         """把参数名到有限实数的映射绑定进电路，返回参数为空的新电路。"""
         return bind_parameters(circuit, values)
+
+    def expectation(
+        self,
+        circuit: Any,
+        observables: Any,
+        values: Any = None,
+        shots: Any = None,
+        seed: Any = None,
+    ) -> dict:
+        """无噪声状态向量仿真并估计各 Pauli observable 的期望值。
+
+        省略 ``shots`` 返回精确期望值；给出 ``shots`` 则每项独立采样并
+        返回正一/负一计数。相同输入与 ``seed`` 结果完全一致，不修改输入。
+        """
+        return estimate_expectation(circuit, observables, values=values, shots=shots, seed=seed)
