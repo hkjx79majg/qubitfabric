@@ -9,6 +9,10 @@ observable 是长度等于 ``qubit_count`` 的 Pauli 串，字符 ``I/X/Y/Z``
 observable 独立采样 ``shots`` 次，返回正一/负一计数及由计数得到的
 期望值。相同输入与 ``seed`` 产生完全相同的结果；采样 RNG 按
 ``f"{seed}:{index}"`` 派生，各项计数只依赖 seed、序号与 shots。
+
+:func:`estimate_gradient` 在精确期望值基础上给出参数移位梯度：
+仅覆盖 rx/rz 的线性参数角，按声明参数顺序返回各 observable 的
+精确导数。
 """
 
 from __future__ import annotations
@@ -17,9 +21,9 @@ import math
 import random
 from typing import Any
 
-from .circuit import bind_parameters
+from .circuit import bind_parameters, normalize_circuit
 
-__all__ = ["SimulationError", "estimate_expectation"]
+__all__ = ["SimulationError", "estimate_expectation", "estimate_gradient"]
 
 _MAX_QUBITS = 20
 _PAULI_CHARS = frozenset("IXYZ")
@@ -265,3 +269,77 @@ def estimate_expectation(
             })
 
     return {"qubit_count": qubit_count, "shots": shot_count, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 参数移位梯度
+# ---------------------------------------------------------------------------
+
+_HALF_PI = math.pi / 2.0
+
+
+def _simulate_with_shift(bound: dict, op_index: int, shift: float) -> list[complex]:
+    """在绑定电路基础上把第 op_index 个旋转门角度平移 shift 后仿真。"""
+    operations = [dict(op) for op in bound["operations"]]
+    operations[op_index]["angle"] = operations[op_index]["angle"] + shift
+    return _simulate({
+        "qubit_count": bound["qubit_count"],
+        "parameters": [],
+        "operations": operations,
+    })
+
+
+def estimate_gradient(circuit: Any, observables: Any, values: Any = None) -> dict:
+    """精确参数移位梯度：各 observable 对全部声明参数的导数，不修改输入。
+
+    校验与失败语义和精确 :func:`estimate_expectation` 一致。角度为
+    ``aθ+b`` 的旋转门对参数 θ 的单次贡献为 ``a/2`` 乘以该门角度单独
+    增减 ``π/2`` 后两次精确期望值之差；同一参数出现在多个旋转门时
+    累加各门贡献，未用于参数化旋转的参数导数为 ``0.0``。
+
+    返回 ``{"qubit_count", "parameters", "results"}``：parameters 保持
+    声明顺序；results 保持 observables 输入顺序（含重复项），每项为
+    ``{"observable", "expectation", "gradients"}``，gradients 按
+    parameters 顺序给出浮点导数；所有输出把 ``-0.0`` 规范为 ``0.0``。
+    """
+    normalized = normalize_circuit(circuit)
+    bound = bind_parameters(normalized, {} if values is None else values)
+    qubit_count = bound["qubit_count"]
+
+    pauli_strings = _validate_observables(observables, qubit_count)
+
+    if qubit_count > _MAX_QUBITS:
+        raise SimulationError(
+            "state_space_too_large", "qubit_count",
+            f"qubit_count {qubit_count} exceeds the {_MAX_QUBITS}-qubit state vector limit",
+        )
+
+    parameters = list(normalized["parameters"])
+
+    base_state = _simulate(bound)
+    base = [_pauli_expectation(base_state, obs) for obs in pauli_strings]
+
+    # 绑定前后操作一一对应；收集各参数出现的旋转门（下标与线性系数）。
+    contributions: dict[str, list[tuple[int, float]]] = {name: [] for name in parameters}
+    for i, op in enumerate(normalized["operations"]):
+        angle = op.get("angle")
+        if isinstance(angle, dict):
+            contributions[angle["parameter"]].append((i, angle["coefficient"]))
+
+    totals = {name: [0.0] * len(pauli_strings) for name in parameters}
+    for name in parameters:
+        for op_index, coefficient in contributions[name]:
+            plus_state = _simulate_with_shift(bound, op_index, _HALF_PI)
+            minus_state = _simulate_with_shift(bound, op_index, -_HALF_PI)
+            factor = coefficient / 2.0
+            for k, obs in enumerate(pauli_strings):
+                plus = _pauli_expectation(plus_state, obs)
+                minus = _pauli_expectation(minus_state, obs)
+                totals[name][k] += factor * (plus - minus)
+
+    results: list[dict] = []
+    for k, obs in enumerate(pauli_strings):
+        gradients = {name: _canon_float(totals[name][k]) for name in parameters}
+        results.append({"observable": obs, "expectation": base[k], "gradients": gradients})
+
+    return {"qubit_count": qubit_count, "parameters": parameters, "results": results}
