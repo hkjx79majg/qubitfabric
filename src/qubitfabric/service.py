@@ -17,6 +17,7 @@ from .circuit import (
     normalize_circuit,
     simplify_circuit,
 )
+from .gradient import estimate_gradient
 from .simulate import SimulationError, estimate_expectation
 
 __all__ = [
@@ -65,3 +66,13 @@ class Service:
         返回正一/负一计数。相同输入与 ``seed`` 结果完全一致，不修改输入。
         """
         return estimate_expectation(circuit, observables, values=values, shots=shots, seed=seed)
+
+    def gradient(self, circuit: Any, observables: Any, values: Any = None) -> dict:
+        """精确参数移位梯度：各 observable 期望值对全部声明参数的导数。
+
+        参数含义与 :meth:`expectation` 一致；仅覆盖 rx/rz 线性参数角的
+        无噪声精确计算。返回 ``{"qubit_count", "parameters", "results"}``，
+        每项结果含 ``observable``、精确 ``expectation`` 与按声明顺序的
+        ``gradients`` 映射。校验及失败语义与精确 expectation 一致。
+        """
+        return estimate_gradient(circuit, observables, values=values)
