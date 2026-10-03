@@ -6,7 +6,8 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 确定性变分优化委托给 :mod:`qubitfabric.optimize`，可暂停续算的优化
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
-委托给 :mod:`qubitfabric.batch`，错误类型在本模块公开。
+委托给 :mod:`qubitfabric.batch`，带 LRU 缓存与稳定请求身份的期望值
+估计委托给 :mod:`qubitfabric.cache`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from typing import Any
 from . import __version__
 from .batch import BatchExecutionError
 from .batch import run_batch as _run_batch
+from .cache import CacheStateError
+from .cache import cached_expectation as _cached_expectation
 from .circuit import (
     CircuitValidationError,
     ParameterBindingError,
@@ -39,6 +42,7 @@ __all__ = [
     "ResourceEstimationError",
     "RuntimeStateError",
     "BatchExecutionError",
+    "CacheStateError",
 ]
 
 
@@ -83,6 +87,35 @@ class Service:
         """
         return estimate_expectation(
             circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
+        )
+
+    def cached_expectation(
+        self,
+        circuit: Any,
+        observables: Any,
+        values: Any = None,
+        shots: Any = None,
+        seed: Any = None,
+        noise: Any = None,
+        cache: Any = None,
+        max_entries: Any = None,
+    ) -> dict:
+        """带 LRU 缓存与稳定请求身份的期望值估计，不改变 :meth:`expectation`。
+
+        基础输入与 :meth:`expectation` 同含义、同校验顺序、同异常类型与
+        量子位限制；``cache`` 为 ``{"version": 1, "entries"}`` 快照，
+        ``max_entries`` 省略为 128。返回 ``{"result", "cache_hit",
+        "request_id", "cache"}``：``result`` 与直接调用
+        :meth:`expectation` 完全一致；``request_id`` 是请求身份的
+        SHA-256（64 位小写十六进制）；``cache`` 仅含 JSON 原生类型，
+        序列化往返后可跨进程传回复用。命中时核对摘要、返回独立副本并
+        把条目移到首位；未命中时计算插入，超出容量淘汰末项。
+        ``max_entries`` 或 ``cache`` 校验失败抛 :class:`CacheStateError`。
+        不修改输入。
+        """
+        return _cached_expectation(
+            circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
+            cache=cache, max_entries=max_entries,
         )
 
     def batch_expectation(self, circuit: Any, jobs: Any, max_concurrency: Any = None) -> dict:
