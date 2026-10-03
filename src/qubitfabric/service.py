@@ -19,7 +19,12 @@ from .circuit import (
     normalize_circuit,
     simplify_circuit,
 )
-from .optimize import OptimizationError, optimize_circuit
+from .optimize import (
+    OptimizationError,
+    RuntimeStateError,
+    optimize_circuit,
+    optimize_resumable,
+)
 from .resources import ResourceEstimationError
 from .resources import estimate_resources as _estimate_resources
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
@@ -30,6 +35,7 @@ __all__ = [
     "ParameterBindingError",
     "SimulationError",
     "OptimizationError",
+    "RuntimeStateError",
     "ResourceEstimationError",
 ]
 
@@ -107,6 +113,37 @@ class Service:
         可选 ``noise`` 沿用逐门局部退极化语义。
         """
         return optimize_circuit(circuit, terms, values, config, noise=noise)
+
+    def optimize_resumable(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any,
+        config: Any,
+        noise: Any = None,
+        step_budget: Any = None,
+        checkpoint: Any = None,
+    ) -> dict:
+        """可暂停、可跨进程续算的确定性变分优化。
+
+        基础输入与 :meth:`optimize` 相同含义、相同校验顺序与异常；
+        ``step_budget`` 为正整数，限制单次调用至多执行的更新次数。
+        省略 ``checkpoint`` 从 iteration 0 开始，否则从检查点续算。
+        未结束时返回 ``{"status": "paused", "result": None,
+        "checkpoint", "progress"}``，``progress`` 含 ``iterations``、
+        ``parameters``、``values``、``objective``、``gradient_norm``
+        与从 iteration 0 起的完整 ``history``；结束时返回
+        ``{"status": "completed", "result", "checkpoint": None}``，
+        ``result`` 与相同输入直接调用 :meth:`optimize` 一致。
+        ``step_budget`` 非法抛出 ``RuntimeStateError``
+        （``invalid_step_budget``）；检查点非法为
+        ``invalid_checkpoint``，来源不符为 ``checkpoint_mismatch``。
+        不修改输入，不读写文件，检查点仅含 JSON 原生类型。
+        """
+        return optimize_resumable(
+            circuit, terms, values, config,
+            noise=noise, step_budget=step_budget, checkpoint=checkpoint,
+        )
 
     def estimate_resources(self, circuit: Any, request: Any, budget: Any = None) -> dict:
         """不执行计算的资源预算准入估计。

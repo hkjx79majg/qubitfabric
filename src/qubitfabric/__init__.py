@@ -1,7 +1,7 @@
 """QubitFabric - 量子-经典混合计算的编排与仿真平台."""
 
 from .circuit import CircuitValidationError, ParameterBindingError
-from .optimize import OptimizationError
+from .optimize import OptimizationError, RuntimeStateError
 from .resources import ResourceEstimationError
 from .simulate import SimulationError
 
@@ -13,5 +13,6 @@ __all__ = [
     "ParameterBindingError",
     "SimulationError",
     "OptimizationError",
+    "RuntimeStateError",
     "ResourceEstimationError",
 ]
