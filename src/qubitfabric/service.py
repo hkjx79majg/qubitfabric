@@ -3,8 +3,9 @@
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
 参数绑定委托给 :mod:`qubitfabric.circuit`，状态向量/密度矩阵仿真、
 Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
-确定性变分优化委托给 :mod:`qubitfabric.optimize`，不执行计算的资源
-预算准入估计委托给 :mod:`qubitfabric.resources`，错误类型在本模块公开。
+确定性变分优化委托给 :mod:`qubitfabric.optimize`，可暂停续算的优化
+委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
+委托给 :mod:`qubitfabric.resources`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from .circuit import (
 from .optimize import OptimizationError, optimize_circuit
 from .resources import ResourceEstimationError
 from .resources import estimate_resources as _estimate_resources
+from .resumable import RuntimeStateError
+from .resumable import optimize_resumable as _optimize_resumable
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
 
 __all__ = [
@@ -31,6 +34,7 @@ __all__ = [
     "SimulationError",
     "OptimizationError",
     "ResourceEstimationError",
+    "RuntimeStateError",
 ]
 
 
@@ -107,6 +111,33 @@ class Service:
         可选 ``noise`` 沿用逐门局部退极化语义。
         """
         return optimize_circuit(circuit, terms, values, config, noise=noise)
+
+    def optimize_resumable(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any,
+        config: Any,
+        noise: Any = None,
+        step_budget: Any = None,
+        checkpoint: Any = None,
+    ) -> dict:
+        """可暂停、跨进程续算的确定性变分优化。
+
+        基础输入与 :meth:`optimize` 相同；``step_budget`` 为正整数更新
+        预算，每次调用至多执行这么多次参数更新。未结束时返回
+        ``{"status": "paused", "result": None, "checkpoint", "progress"}``，
+        检查点仅含 JSON 原生类型，序列化往返后可跨进程传回续算；
+        结束时返回 ``{"status": "completed", "result",
+        "checkpoint": None, "progress"}``，``result`` 与相同输入直接
+        调用 :meth:`optimize` 完全一致。``step_budget`` 与
+        ``checkpoint`` 校验失败抛 :class:`RuntimeStateError`；
+        基础输入的校验顺序与异常和 :meth:`optimize` 相同。不修改输入。
+        """
+        return _optimize_resumable(
+            circuit, terms, values, config,
+            noise=noise, step_budget=step_budget, checkpoint=checkpoint,
+        )
 
     def estimate_resources(self, circuit: Any, request: Any, budget: Any = None) -> dict:
         """不执行计算的资源预算准入估计。

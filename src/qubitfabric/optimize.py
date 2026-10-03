@@ -21,6 +21,10 @@
 → noise（:class:`SimulationError`）→ 优化器配置
 （:class:`OptimizationError`）→ 状态空间上限（:class:`SimulationError`，
 随首次目标评估发生，先于任何参数更新）。
+
+:func:`_prepare`、:func:`_initial_state`、:func:`_advance` 与
+:func:`_finalize` 把校验、初始评估、按预算推进与结果汇总拆开，
+供 :mod:`qubitfabric.resumable` 的可暂停续算入口复用同一实现。
 """
 
 from __future__ import annotations
@@ -248,36 +252,31 @@ def _snapshot(iteration: int, values: dict[str, float], objective: float, norm: 
     }
 
 
-def optimize_circuit(
+def _norm(gradients: dict[str, float], parameters: list[str]) -> float:
+    return math.sqrt(sum(gradients[name] * gradients[name] for name in parameters))
+
+
+def _prepare(
     circuit: Any,
     terms: Any,
     values: Any,
     config: Any,
-    noise: Any = None,
-) -> dict:
-    """确定性变分优化，不修改输入，不使用随机数。
+    noise: Any,
+) -> tuple[dict, dict, list[str], list[float], tuple[float, float], dict, list[str], Any]:
+    """按固定顺序校验基础优化输入，返回优化循环所需的全部派生量。
 
-    返回 ``{"converged", "iterations", "parameters", "final_values",
-    "final_objective", "history"}``：``parameters`` 保持声明顺序；
-    ``history`` 保存初始点（iteration 0）和每次更新后的状态，每项为
-    ``{"iteration", "values", "objective", "gradient_norm"}``。
+    校验顺序：电路 → 初始参数绑定 → Hamiltonian 项结构 → observable
+    内容 → noise → 优化器配置；状态空间上限随首次目标评估发生。
     """
     normalized = normalize_circuit(circuit)
     initial = {} if values is None else values
     bind_parameters(normalized, initial)
     observables, coefficients = _validate_terms(terms)
     _validate_observables(observables, normalized["qubit_count"])
-    _validate_noise(noise)
+    noise_probs = _validate_noise(noise)
     cfg = _validate_config(config)
 
     parameters = list(normalized["parameters"])
-    method = cfg["method"]
-    learning_rate = cfg["learning_rate"]
-    max_iterations = cfg["max_iterations"]
-    tolerance = cfg["tolerance"]
-    beta1 = cfg["beta1"]
-    beta2 = cfg["beta2"]
-    epsilon = cfg["epsilon"]
 
     def _evaluate(point: dict[str, float]) -> tuple[float, dict[str, float]]:
         result = estimate_gradient(normalized, observables, values=point, noise=noise)
@@ -290,20 +289,52 @@ def optimize_circuit(
                 gradients[name] += coefficient * item["gradients"][name]
         return objective, gradients
 
-    def _norm(gradients: dict[str, float]) -> float:
-        return math.sqrt(sum(gradients[name] * gradients[name] for name in parameters))
+    return normalized, initial, observables, coefficients, noise_probs, cfg, parameters, _evaluate
 
+
+def _initial_state(parameters: list[str], initial: dict, evaluate: Any) -> dict:
+    """iteration 0 的循环状态：初始点评估，未做任何更新。"""
     current = {name: float(initial[name]) for name in parameters}
-    objective, gradients = _evaluate(current)
-    norm = _norm(gradients)
-    history = [_snapshot(0, current, objective, norm)]
-    iterations = 0
+    objective, gradients = evaluate(current)
+    norm = _norm(gradients, parameters)
+    return {
+        "iterations": 0,
+        "current": current,
+        "gradients": gradients,
+        "objective": objective,
+        "norm": norm,
+        "history": [_snapshot(0, current, objective, norm)],
+        "first_moment": {name: 0.0 for name in parameters},
+        "second_moment": {name: 0.0 for name in parameters},
+    }
+
+
+def _advance(state: dict, cfg: dict, parameters: list[str], evaluate: Any, budget: int) -> None:
+    """就地推进 ``state``，至多执行 ``budget`` 次参数更新。
+
+    梯度范数不大于 ``tolerance`` 或累计更新达到 ``max_iterations`` 时
+    提前停止；数值与未分段执行完全相同。
+    """
+    method = cfg["method"]
+    learning_rate = cfg["learning_rate"]
+    max_iterations = cfg["max_iterations"]
+    tolerance = cfg["tolerance"]
+    beta1 = cfg["beta1"]
+    beta2 = cfg["beta2"]
+    epsilon = cfg["epsilon"]
+
+    iterations = state["iterations"]
+    current = state["current"]
+    gradients = state["gradients"]
+    objective = state["objective"]
+    norm = state["norm"]
+    history = state["history"]
+    first_moment = state["first_moment"]
+    second_moment = state["second_moment"]
     converged = norm <= tolerance
+    remaining = budget
 
-    first_moment = {name: 0.0 for name in parameters}
-    second_moment = {name: 0.0 for name in parameters}
-
-    while not converged and iterations < max_iterations:
+    while not converged and iterations < max_iterations and remaining > 0:
         if method == "gradient_descent":
             current = {
                 name: current[name] - learning_rate * gradients[name]
@@ -324,16 +355,46 @@ def optimize_circuit(
             current = updated
 
         iterations += 1
-        objective, gradients = _evaluate(current)
-        norm = _norm(gradients)
+        objective, gradients = evaluate(current)
+        norm = _norm(gradients, parameters)
         history.append(_snapshot(iterations, current, objective, norm))
         converged = norm <= tolerance
+        remaining -= 1
 
+    state["iterations"] = iterations
+    state["current"] = current
+    state["gradients"] = gradients
+    state["objective"] = objective
+    state["norm"] = norm
+
+
+def _finalize(state: dict, cfg: dict, parameters: list[str]) -> dict:
+    """把循环状态汇总为 ``optimize`` 的返回对象。"""
     return {
-        "converged": converged,
-        "iterations": iterations,
+        "converged": state["norm"] <= cfg["tolerance"],
+        "iterations": state["iterations"],
         "parameters": parameters,
-        "final_values": {name: _canon_float(current[name]) for name in parameters},
-        "final_objective": _canon_float(objective),
-        "history": history,
+        "final_values": {name: _canon_float(state["current"][name]) for name in parameters},
+        "final_objective": _canon_float(state["objective"]),
+        "history": state["history"],
     }
+
+
+def optimize_circuit(
+    circuit: Any,
+    terms: Any,
+    values: Any,
+    config: Any,
+    noise: Any = None,
+) -> dict:
+    """确定性变分优化，不修改输入，不使用随机数。
+
+    返回 ``{"converged", "iterations", "parameters", "final_values",
+    "final_objective", "history"}``：``parameters`` 保持声明顺序；
+    ``history`` 保存初始点（iteration 0）和每次更新后的状态，每项为
+    ``{"iteration", "values", "objective", "gradient_norm"}``。
+    """
+    _, initial, _, _, _, cfg, parameters, evaluate = _prepare(circuit, terms, values, config, noise)
+    state = _initial_state(parameters, initial, evaluate)
+    _advance(state, cfg, parameters, evaluate, cfg["max_iterations"])
+    return _finalize(state, cfg, parameters)
