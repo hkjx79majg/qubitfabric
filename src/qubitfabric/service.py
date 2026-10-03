@@ -3,7 +3,7 @@
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
 参数绑定委托给 :mod:`qubitfabric.circuit`，状态向量/密度矩阵仿真、
 Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
-错误类型在本模块公开。
+确定性变分优化委托给 :mod:`qubitfabric.optimize`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from .circuit import (
     normalize_circuit,
     simplify_circuit,
 )
+from .optimize import OptimizationError, optimize_circuit
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
 
 __all__ = [
@@ -25,6 +26,7 @@ __all__ = [
     "CircuitValidationError",
     "ParameterBindingError",
     "SimulationError",
+    "OptimizationError",
 ]
 
 
@@ -80,3 +82,24 @@ class Service:
         可选 ``noise`` 描述逐门局部退极化噪声，省略时行为不变。
         """
         return estimate_gradient(circuit, observables, values=values, noise=noise)
+
+    def optimize(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any,
+        config: Any,
+        noise: Any = None,
+    ) -> dict:
+        """确定性变分优化：精确目标评估与 gradient_descent / adam 经典更新。
+
+        ``terms`` 为 Hamiltonian 项数组，每项含匹配量子位数的 Pauli
+        ``observable`` 与有限实数 ``coefficient``；目标值按输入顺序累加
+        期望值与系数的乘积。``values`` 为完整且无未知名称的初始参数；
+        ``config`` 给出 ``method``、``learning_rate``、``max_iterations``、
+        ``tolerance`` 及 adam 可选的 ``beta1``/``beta2``/``epsilon``。
+        返回 ``{"converged", "iterations", "parameters", "final_values",
+        "final_objective", "history"}``。不修改输入，不使用随机数；
+        可选 ``noise`` 沿用逐门局部退极化语义。
+        """
+        return optimize_circuit(circuit, terms, values, config, noise=noise)
