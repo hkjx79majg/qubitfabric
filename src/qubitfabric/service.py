@@ -3,6 +3,7 @@
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
 参数绑定委托给 :mod:`qubitfabric.circuit`，状态向量/密度矩阵仿真、
 Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
+同一电路上的批量期望值执行委托给 :mod:`qubitfabric.batch`，
 确定性变分优化委托给 :mod:`qubitfabric.optimize`，可暂停续算的优化
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，错误类型在本模块公开。
@@ -13,6 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 from . import __version__
+from .batch import BatchExecutionError
+from .batch import expectation_batch as _expectation_batch
 from .circuit import (
     CircuitValidationError,
     ParameterBindingError,
@@ -29,6 +32,7 @@ from .simulate import SimulationError, estimate_expectation, estimate_gradient
 
 __all__ = [
     "Service",
+    "BatchExecutionError",
     "CircuitValidationError",
     "ParameterBindingError",
     "SimulationError",
@@ -80,6 +84,22 @@ class Service:
         return estimate_expectation(
             circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
         )
+
+    def expectation_batch(self, circuit: Any, jobs: Any, max_concurrency: Any = None) -> dict:
+        """在同一电路上批量执行相互独立的 Pauli 期望值作业。
+
+        ``jobs`` 为非空数组，每项含唯一的非空字符串 ``id`` 与必填的
+        ``observables``，可选 ``values``/``shots``/``seed``/``noise`` 的
+        语义与 :meth:`expectation` 相同。``max_concurrency`` 省略时为 1，
+        显式值必须是排除 bool 的正整数，实际并行度不超过该值。返回
+        ``{"results", "summary"}``：results 按 jobs 输入顺序排列，成功项
+        携带单次入口的完整 result 且 error 为 None；单个作业的参数绑定或
+        仿真校验失败只使该项 failed（空 result，error 给出原异常类名、
+        code 与 path），其余作业继续。结构校验失败抛
+        :class:`BatchExecutionError`，电路校验失败仍抛
+        :class:`CircuitValidationError`。不修改输入。
+        """
+        return _expectation_batch(circuit, jobs, max_concurrency=max_concurrency)
 
     def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。
