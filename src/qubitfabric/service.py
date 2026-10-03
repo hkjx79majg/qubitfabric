@@ -19,12 +19,14 @@ from .circuit import (
     simplify_circuit,
 )
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
+from .optimize import OptimizationError, run_optimization
 
 __all__ = [
     "Service",
     "CircuitValidationError",
     "ParameterBindingError",
     "SimulationError",
+    "OptimizationError",
 ]
 
 
@@ -80,3 +82,21 @@ class Service:
         可选 ``noise`` 描述逐门局部退极化噪声，省略时行为不变。
         """
         return estimate_gradient(circuit, observables, values=values, noise=noise)
+
+    def optimize(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any = None,
+        config: Any = None,
+        noise: Any = None,
+    ) -> dict:
+        """确定性变分优化：加权 Hamiltonian 目标 + 经典参数更新。
+
+        ``terms`` 为非空数组，每项含长度匹配量子位数的 Pauli
+        ``observable`` 与有限实 ``coefficient``，目标按输入顺序累加
+        期望值与系数的乘积。``config`` 选择 ``gradient_descent`` 或
+        ``adam``；不支持 shots，不使用随机数，不修改输入。
+        可选 ``noise`` 语义与 :meth:`gradient` 一致。
+        """
+        return run_optimization(circuit, terms, values=values, config=config, noise=noise)
