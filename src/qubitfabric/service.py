@@ -19,6 +19,7 @@ from .circuit import (
     simplify_circuit,
 )
 from .optimize import OptimizationError, optimize_circuit
+from .resources import ResourceEstimationError, estimate_resources
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "ParameterBindingError",
     "SimulationError",
     "OptimizationError",
+    "ResourceEstimationError",
 ]
 
 
@@ -103,3 +105,15 @@ class Service:
         可选 ``noise`` 沿用逐门局部退极化语义。
         """
         return optimize_circuit(circuit, terms, values, config, noise=noise)
+
+    def estimate_resources(self, circuit: Any, request: Any, budget: Any = None) -> dict:
+        """不执行计算的资源预算准入。
+
+        ``request`` 的 ``type`` 取 ``exact_expectation``、
+        ``sampled_expectation``、``gradient``、``optimization``，字段
+        沿用对应入口；返回状态表示与规模、电路评估次数、门应用次数、
+        采样总数、运行时支持标志、超限预算键与准入结论。``budget``
+        省略为无限制。不修改输入，超限不抛异常；非法请求/预算抛
+        :class:`ResourceEstimationError`，其他错误沿用对应入口语义。
+        """
+        return estimate_resources(circuit, request, budget)

@@ -2,6 +2,7 @@
 
 from .circuit import CircuitValidationError, ParameterBindingError
 from .optimize import OptimizationError
+from .resources import ResourceEstimationError
 from .simulate import SimulationError
 
 __version__ = "0.1.0"
@@ -12,4 +13,5 @@ __all__ = [
     "ParameterBindingError",
     "SimulationError",
     "OptimizationError",
+    "ResourceEstimationError",
 ]
