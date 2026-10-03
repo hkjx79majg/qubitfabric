@@ -3,7 +3,8 @@
 健康检查保持冻结基线行为；量子电路 IR 的构造、规范化、等价变换与
 参数绑定委托给 :mod:`qubitfabric.circuit`，状态向量/密度矩阵仿真、
 Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
-确定性变分优化委托给 :mod:`qubitfabric.optimize`，错误类型在本模块公开。
+确定性变分优化委托给 :mod:`qubitfabric.optimize`，不执行计算的资源
+预算准入估计委托给 :mod:`qubitfabric.resources`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from .circuit import (
     simplify_circuit,
 )
 from .optimize import OptimizationError, optimize_circuit
+from .resources import ResourceEstimationError
+from .resources import estimate_resources as _estimate_resources
 from .simulate import SimulationError, estimate_expectation, estimate_gradient
 
 __all__ = [
@@ -27,6 +30,7 @@ __all__ = [
     "ParameterBindingError",
     "SimulationError",
     "OptimizationError",
+    "ResourceEstimationError",
 ]
 
 
@@ -103,3 +107,16 @@ class Service:
         可选 ``noise`` 沿用逐门局部退极化语义。
         """
         return optimize_circuit(circuit, terms, values, config, noise=noise)
+
+    def estimate_resources(self, circuit: Any, request: Any, budget: Any = None) -> dict:
+        """不执行计算的资源预算准入估计。
+
+        ``request.type`` 取 ``exact_expectation``/``sampled_expectation``/
+        ``gradient``/``optimization``，字段沿用对应入口，无关字段非法。
+        返回 ``{"qubit_count", "type", "representation", "state_elements",
+        "state_bytes", "circuit_evaluations", "gate_applications",
+        "total_shots", "runtime_supported", "admitted", "exceeded"}``。
+        ``budget`` 省略为无限制；超限只写入 ``exceeded``，不抛异常。
+        校验失败语义与对应计算入口一致，不修改输入。
+        """
+        return _estimate_resources(circuit, request, budget=budget)
