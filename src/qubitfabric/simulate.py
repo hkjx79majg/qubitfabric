@@ -456,7 +456,7 @@ def _validate_noise(noise: Any) -> tuple[float, float]:
     return probs[0], probs[1]
 
 
-def estimate_expectation(
+def _prepare_expectation(
     circuit: Any,
     observables: Any,
     values: Any = None,
@@ -464,15 +464,14 @@ def estimate_expectation(
     seed: Any = None,
     noise: Any = None,
 ) -> dict:
-    """估计电路末态上各 Pauli observable 的期望值，不修改输入。
+    """执行 :func:`estimate_expectation` 的全部校验并返回规范化后的请求。
 
-    电路沿用现有校验与参数绑定语义；``shots`` 省略时返回精确期望值，
-    否则每项独立采样并返回 ``{"positive", "negative"}`` 计数。返回
-    ``{"qubit_count", "shots", "results"}``，其中 results 按 observables
-    输入顺序排列，全部为 JSON 原生类型。
-
-    ``noise`` 可给出逐门局部退极化概率（见模块文档）；任一概率非零时
-    按含噪末态的密度矩阵求精确期望值，采样仍按含噪精确值进行。
+    校验顺序与异常类型与直接调用入口完全一致。返回仅含 JSON 原生
+    类型的新对象：``bound`` 为完整绑定后的规范电路，``observables``
+    为保序（含重复项）的 Pauli 串列表，``shots`` 为解析后的正整数或
+    None，``seed`` 为解析后的采样种子（省略 shots 时为 None；给了
+    shots 而省略 seed 时补默认值 0），``noise`` 为补齐默认值的
+    ``{"single_qubit_depolarizing", "two_qubit_depolarizing"}``。
     """
     bound = bind_parameters(circuit, {} if values is None else values)
     qubit_count = bound["qubit_count"]
@@ -490,7 +489,29 @@ def estimate_expectation(
             f"qubit_count {qubit_count} exceeds the {max_qubits}-qubit simulation limit",
         )
 
-    if noisy:
+    return {
+        "bound": bound,
+        "observables": pauli_strings,
+        "shots": shot_count,
+        "seed": resolved_seed,
+        "noise": {
+            "single_qubit_depolarizing": _canon_float(p1),
+            "two_qubit_depolarizing": _canon_float(p2),
+        },
+    }
+
+
+def _compute_expectation(prepared: dict) -> dict:
+    """对 :func:`_prepare_expectation` 的结果执行仿真与采样。"""
+    bound = prepared["bound"]
+    pauli_strings = prepared["observables"]
+    shot_count = prepared["shots"]
+    resolved_seed = prepared["seed"]
+    p1 = prepared["noise"]["single_qubit_depolarizing"]
+    p2 = prepared["noise"]["two_qubit_depolarizing"]
+    qubit_count = bound["qubit_count"]
+
+    if p1 != 0.0 or p2 != 0.0:
         rho = _simulate_noisy(bound, p1, p2)
         size = 1 << qubit_count
         exact = [_dm_pauli_expectation(rho, size, obs) for obs in pauli_strings]
@@ -515,6 +536,30 @@ def estimate_expectation(
             })
 
     return {"qubit_count": qubit_count, "shots": shot_count, "results": results}
+
+
+def estimate_expectation(
+    circuit: Any,
+    observables: Any,
+    values: Any = None,
+    shots: Any = None,
+    seed: Any = None,
+    noise: Any = None,
+) -> dict:
+    """估计电路末态上各 Pauli observable 的期望值，不修改输入。
+
+    电路沿用现有校验与参数绑定语义；``shots`` 省略时返回精确期望值，
+    否则每项独立采样并返回 ``{"positive", "negative"}`` 计数。返回
+    ``{"qubit_count", "shots", "results"}``，其中 results 按 observables
+    输入顺序排列，全部为 JSON 原生类型。
+
+    ``noise`` 可给出逐门局部退极化概率（见模块文档）；任一概率非零时
+    按含噪末态的密度矩阵求精确期望值，采样仍按含噪精确值进行。
+    """
+    prepared = _prepare_expectation(
+        circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
+    )
+    return _compute_expectation(prepared)
 
 
 # ---------------------------------------------------------------------------
