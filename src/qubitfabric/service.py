@@ -5,7 +5,8 @@
 Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`，
 确定性变分优化委托给 :mod:`qubitfabric.optimize`，可暂停续算的优化
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
-委托给 :mod:`qubitfabric.resources`，错误类型在本模块公开。
+委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
+委托给 :mod:`qubitfabric.batch`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 from . import __version__
+from .batch import BatchExecutionError
+from .batch import run_batch as _run_batch
 from .circuit import (
     CircuitValidationError,
     ParameterBindingError,
@@ -35,6 +38,7 @@ __all__ = [
     "OptimizationError",
     "ResourceEstimationError",
     "RuntimeStateError",
+    "BatchExecutionError",
 ]
 
 
@@ -80,6 +84,21 @@ class Service:
         return estimate_expectation(
             circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
         )
+
+    def batch_expectation(self, circuit: Any, jobs: Any, max_concurrency: Any = None) -> dict:
+        """在同一电路上批量执行多个独立期望值作业。
+
+        公共电路先按现有语义规范化，失败抛 :class:`CircuitValidationError`；
+        ``max_concurrency`` 省略为 1，显式值必须是排除 bool 的正整数；
+        ``jobs`` 必须是非空数组，每项含唯一的非空字符串 ``id`` 与必填
+        ``observables``，可携带与 :meth:`expectation` 同语义的
+        ``values``/``shots``/``seed``/``noise``。返回 ``{"results",
+        "summary"}``，results 按 jobs 输入顺序排列；单项绑定或仿真失败
+        只影响该项，其余继续。请求级结构错误抛
+        :class:`BatchExecutionError`。相同输入在任意合法并行度下结果
+        内容一致，不修改输入。
+        """
+        return _run_batch(circuit, jobs, max_concurrency=max_concurrency)
 
     def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。
