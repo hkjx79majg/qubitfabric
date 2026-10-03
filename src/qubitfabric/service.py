@@ -7,7 +7,9 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
 委托给 :mod:`qubitfabric.batch`，带 LRU 缓存与稳定请求身份的期望值
-估计委托给 :mod:`qubitfabric.cache`，错误类型在本模块公开。
+估计委托给 :mod:`qubitfabric.cache`，可序列化的异步参数服务器
+（参数状态创建与批量梯度更新）委托给 :mod:`qubitfabric.paramserver`，
+错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ from .circuit import (
     simplify_circuit,
 )
 from .optimize import OptimizationError, optimize_circuit
+from .paramserver import ParameterServerError
+from .paramserver import apply_parameter_updates as _apply_parameter_updates
+from .paramserver import create_parameter_state as _create_parameter_state
 from .resources import ResourceEstimationError
 from .resources import estimate_resources as _estimate_resources
 from .resumable import RuntimeStateError
@@ -43,6 +48,7 @@ __all__ = [
     "RuntimeStateError",
     "BatchExecutionError",
     "CacheStateError",
+    "ParameterServerError",
 ]
 
 
@@ -190,6 +196,44 @@ class Service:
             circuit, terms, values, config,
             noise=noise, step_budget=step_budget, checkpoint=checkpoint,
         )
+
+    def create_parameter_state(self, circuit: Any, values: Any) -> dict:
+        """创建可序列化的异步参数服务器状态。
+
+        电路规范化与参数绑定沿用 :meth:`create_circuit` 与 :meth:`bind`
+        的语义，失败抛 :class:`CircuitValidationError` 或
+        :class:`ParameterBindingError`。返回的状态仅含 JSON 原生类型：
+        ``{"version", "parameters", "revision", "values", "updates"}``，
+        修订号从零开始，``updates`` 为已接收更新的幂等记录（初始为空）。
+        不修改输入。
+        """
+        return _create_parameter_state(circuit, values)
+
+    def apply_parameter_updates(
+        self,
+        state: Any,
+        learning_rate: Any,
+        max_staleness: Any,
+        updates: Any,
+    ) -> dict:
+        """按数组顺序合并一批基于不同参数版本计算的梯度更新。
+
+        ``learning_rate`` 为正有限实数，``max_staleness`` 为非负整数，
+        ``updates`` 为非空数组，每项含非空字符串 ``id``、非负整数
+        ``base_revision`` 与恰好覆盖全部参数的有限梯度映射
+        ``gradients``。``base_revision`` 不大于当前修订号且版本差不超过
+        ``max_staleness`` 时接收，按 ``value - learning_rate * gradient``
+        更新全部参数并记录内容摘要；过旧更新被拒绝（``stale``），引用
+        未来修订的被拒绝（``future_revision``），均不改变状态；相同 id
+        与内容再次出现返回 ``duplicate`` 及首次接收后的修订号，相同 id
+        对应不同内容时整次调用失败。返回 ``{"state", "results"}``，
+        ``state`` 为全新的最终状态（仅含 JSON 原生类型，序列化往返后
+        继续使用结果一致），``results`` 与更新同序，每项含 ``id``、
+        ``status``、``reason`` 与观察到的 ``revision``。状态、学习率、
+        陈旧度、更新结构、摘要完整性、幂等冲突与非有限计算结果抛
+        :class:`ParameterServerError`，异常时不返回部分状态。不修改输入。
+        """
+        return _apply_parameter_updates(state, learning_rate, max_staleness, updates)
 
     def estimate_resources(self, circuit: Any, request: Any, budget: Any = None) -> dict:
         """不执行计算的资源预算准入估计。
