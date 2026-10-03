@@ -4,6 +4,7 @@ from .batch import BatchExecutionError
 from .cache import CacheStateError
 from .circuit import CircuitValidationError, ParameterBindingError
 from .optimize import OptimizationError
+from .paramserver import ParameterServerError
 from .resources import ResourceEstimationError
 from .resumable import RuntimeStateError
 from .simulate import SimulationError
@@ -20,4 +21,5 @@ __all__ = [
     "ResourceEstimationError",
     "RuntimeStateError",
     "CacheStateError",
+    "ParameterServerError",
 ]

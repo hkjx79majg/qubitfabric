@@ -7,7 +7,8 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
 委托给 :mod:`qubitfabric.batch`，带 LRU 缓存与稳定请求身份的期望值
-估计委托给 :mod:`qubitfabric.cache`，错误类型在本模块公开。
+估计委托给 :mod:`qubitfabric.cache`，可序列化的异步参数服务器委托给
+:mod:`qubitfabric.paramserver`，错误类型在本模块公开。
 """
 
 from __future__ import annotations
@@ -27,6 +28,9 @@ from .circuit import (
     simplify_circuit,
 )
 from .optimize import OptimizationError, optimize_circuit
+from .paramserver import ParameterServerError
+from .paramserver import apply_parameter_updates as _apply_parameter_updates
+from .paramserver import create_parameter_state as _create_parameter_state
 from .resources import ResourceEstimationError
 from .resources import estimate_resources as _estimate_resources
 from .resumable import RuntimeStateError
@@ -43,6 +47,7 @@ __all__ = [
     "RuntimeStateError",
     "BatchExecutionError",
     "CacheStateError",
+    "ParameterServerError",
 ]
 
 
@@ -203,3 +208,42 @@ class Service:
         校验失败语义与对应计算入口一致，不修改输入。
         """
         return _estimate_resources(circuit, request, budget=budget)
+
+    def create_parameter_state(self, circuit: Any, values: Any = None) -> dict:
+        """为参数化电路创建可序列化的异步参数服务器状态。
+
+        沿用现有电路规范化与参数绑定语义，失败抛出现有
+        :class:`CircuitValidationError` 或 :class:`ParameterBindingError`。
+        返回仅含 JSON 原生类型的状态：模式版本 ``version``、参数名
+        ``parameters``、从零开始的修订号 ``revision``、当前有限实数值
+        ``values`` 与为空的已接收更新幂等记录 ``updates``。不修改输入。
+        """
+        return _create_parameter_state(circuit, values)
+
+    def apply_parameter_updates(
+        self,
+        state: Any,
+        learning_rate: Any,
+        max_staleness: Any,
+        updates: Any,
+    ) -> dict:
+        """确定、可重放地合并一批基于不同参数版本计算的梯度更新。
+
+        ``state`` 为 :meth:`create_parameter_state` 或本方法返回的状态
+        （可 JSON 序列化往返后传回）；``learning_rate`` 为正有限数，
+        ``max_staleness`` 为非负整数，``updates`` 为非空数组，每项含非空
+        字符串 ``id``、非负整数 ``base_revision`` 与恰好覆盖全部参数的
+        有限梯度映射 ``gradients``。按数组顺序处理：``base_revision``
+        不大于当前修订号且版本差不超过 ``max_staleness`` 时接受，按
+        ``value = value - learning_rate * gradient`` 更新全部参数并把
+        修订号加一；过旧返回 ``rejected``/``stale``，引用未来修订返回
+        ``rejected``/``future_revision``，均不改变状态；相同 id 与相同
+        内容再次出现返回 ``duplicate`` 及首次接收后的修订号，相同 id
+        对应不同内容时整次调用失败。返回 ``{"state", "details"}``，
+        ``state`` 为全新的最终状态，``details`` 与更新同序，每项给出
+        ``id``、``status``、``reason`` 与观察到的 ``revision``。
+        状态、更新、学习率或陈旧度校验失败，以及摘要破坏、幂等冲突或
+        计算产生非有限数值，都抛 :class:`ParameterServerError`，异常时
+        不返回部分状态。不修改输入。
+        """
+        return _apply_parameter_updates(state, learning_rate, max_staleness, updates)
