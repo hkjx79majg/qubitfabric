@@ -19,13 +19,30 @@
 顺序排列的 ``diagnostics``：每个后端在处理该作业前的已占槽位数、
 slot 总量、是否候选、不适用原因与四项预算的 required/limit/exceeded
 快照，使调用方可以复核每次选择。
+
+:func:`execute_batch_offload` 在完全相同的规划之上把已分配作业交给
+调用方提供的 executor 执行：请求级校验顺序与异常沿用规划入口
+（电路 → backends → jobs 结构），随后校验 ``max_concurrency``
+（沿用 :class:`qubitfabric.batch.BatchExecutionError` 的
+``invalid_concurrency`` 语义）与 ``executors`` 映射（抛
+:class:`OffloadExecutionError` 的 ``invalid_executors``）。每个
+assigned 作业只调用所选后端的 executor 一次，rejected 与
+no_eligible_backend 作业不执行并保留规划详情；全局并行数不超过
+``max_concurrency``，每个后端的并行数不超过其 slots，结果顺序与
+完成先后无关。executor 抛异常或返回不符合 expectation 结果形态的
+值只令该项 failed，其余作业继续且不重试。不修改任何输入与后端
+返回对象。
 """
 
 from __future__ import annotations
 
+import copy
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from .batch import _validate_jobs
+from .batch import _validate_concurrency, _validate_jobs
 from .circuit import (
     CircuitValidationError,
     ParameterBindingError,
@@ -41,7 +58,13 @@ from .simulate import (
     _validate_shots,
 )
 
-__all__ = ["OffloadPlanningError", "plan_batch_offload", "diagnose_batch_offload"]
+__all__ = [
+    "OffloadPlanningError",
+    "OffloadExecutionError",
+    "plan_batch_offload",
+    "diagnose_batch_offload",
+    "execute_batch_offload",
+]
 
 _BYTES_PER_ELEMENT = 16
 _MAX_QUBITS_STATE_VECTOR = 20
@@ -68,6 +91,23 @@ class OffloadPlanningError(ValueError):
     ``invalid_backend`` / ``duplicate_backend_id``），``path`` 指向
     输入中首个出错位置，语义与
     :class:`qubitfabric.circuit.CircuitValidationError` 一致。
+    """
+
+    def __init__(self, code: str, path: str, message: str | None = None) -> None:
+        self.code = code
+        self.path = path
+        if message is None:
+            message = f"{code} at {path}"
+        super().__init__(message)
+
+
+class OffloadExecutionError(ValueError):
+    """卸载执行入口的请求级校验失败。
+
+    ``code`` 为稳定的机器可读错误码（``invalid_executors``），``path``
+    指向输入中出错位置（``executors``），语义与
+    :class:`OffloadPlanningError` 一致。单项作业执行失败不抛此异常，
+    而是转写为该作业结果项中的 ``error`` 对象。
     """
 
     def __init__(self, code: str, path: str, message: str | None = None) -> None:
@@ -473,3 +513,194 @@ def diagnose_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
     """
     normalized, valid_jobs, valid_backends = _prepare_offload_inputs(circuit, jobs, backends)
     return _run_offload(normalized, valid_jobs, valid_backends, diagnose=True)
+
+
+# ---------------------------------------------------------------------------
+# 批量卸载执行
+# ---------------------------------------------------------------------------
+
+
+def _validate_executors(executors: Any, valid_backends: list[dict]) -> dict:
+    """校验 backend id 到 executor 的映射（只读使用，不修改）。
+
+    非映射、键集合未恰好覆盖全部后端 id、或任一值不可调用，均报
+    ``invalid_executors``/``executors``。
+    """
+    if not isinstance(executors, dict):
+        raise OffloadExecutionError(
+            "invalid_executors", "executors",
+            "executors must be a mapping from backend id to callable",
+        )
+    expected = {backend["id"] for backend in valid_backends}
+    if set(executors) != expected:
+        raise OffloadExecutionError(
+            "invalid_executors", "executors",
+            "executors keys must exactly cover the backend ids",
+        )
+    for backend_id, executor in executors.items():
+        if not callable(executor):
+            raise OffloadExecutionError(
+                "invalid_executors", "executors",
+                f"executor for backend {backend_id!r} must be callable",
+            )
+    return executors
+
+
+def _is_finite_number(value: Any) -> bool:
+    """JSON 有限实数；bool 是 int 的子类，但不算数值。"""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_expectation_result(value: Any) -> bool:
+    """判断返回值是否符合 :func:`estimate_expectation` 的结果形态。
+
+    形态为 ``{"qubit_count", "shots", "results"}``：``qubit_count``
+    为排除 bool 的非负整数；``shots`` 为 None（精确）或排除 bool 的
+    正整数（采样）；``results`` 为非空数组，每项含非空字符串
+    ``observable`` 与有限实数 ``expectation``，采样时另含
+    ``{"positive", "negative"}`` 非负整数计数。只校验形态与 JSON
+    原生类型，不修改返回值。
+    """
+    if not isinstance(value, dict):
+        return False
+    if set(value) != {"qubit_count", "shots", "results"}:
+        return False
+    qubit_count = value["qubit_count"]
+    if not _is_int(qubit_count) or qubit_count < 0:
+        return False
+    shots = value["shots"]
+    if shots is not None and (not _is_int(shots) or shots < 1):
+        return False
+    results = value["results"]
+    if not isinstance(results, list) or not results:
+        return False
+    item_keys = {"observable", "expectation"} if shots is None else {
+        "observable", "expectation", "counts",
+    }
+    for item in results:
+        if not isinstance(item, dict) or set(item) != item_keys:
+            return False
+        if not isinstance(item["observable"], str) or not item["observable"]:
+            return False
+        if not _is_finite_number(item["expectation"]):
+            return False
+        if shots is not None:
+            counts = item["counts"]
+            if not isinstance(counts, dict) or set(counts) != {"positive", "negative"}:
+                return False
+            if not _is_int(counts["positive"]) or counts["positive"] < 0:
+                return False
+            if not _is_int(counts["negative"]) or counts["negative"] < 0:
+                return False
+    return True
+
+
+def execute_batch_offload(
+    circuit: Any,
+    jobs: Any,
+    backends: Any,
+    executors: Any,
+    max_concurrency: Any = None,
+) -> dict:
+    """规划批量卸载并把已分配作业交给对应后端的 executor 执行。
+
+    请求级校验顺序与异常沿用 :func:`plan_batch_offload`（电路 →
+    backends → jobs 结构），随后校验 ``max_concurrency``（省略为 1，
+    非排除 bool 的正整数抛
+    :class:`qubitfabric.batch.BatchExecutionError` 的
+    ``invalid_concurrency``/``max_concurrency``）与 ``executors``
+    （非映射、键未恰好覆盖后端 id 或值不可调用抛
+    :class:`OffloadExecutionError` 的 ``invalid_executors``/
+    ``executors``）。
+
+    返回 ``{"plan", "results", "summary"}``：``plan`` 与同输入调用
+    :func:`plan_batch_offload` 的结果逐值一致；``results`` 按 jobs
+    输入顺序排列，rejected 与 no_eligible_backend 项不执行并保留
+    规划详情，assigned 项成功时为 ``{"id", "status": "succeeded",
+    "backend_id", "result"}``，失败时为 ``{"id", "status": "failed",
+    "backend_id", "error"}``（executor 抛异常时 error 保留原异常
+    类型名与消息、code 为 ``backend_failure``；返回值形态非法时
+    type 为 ``OffloadExecutionError``、code 为
+    ``invalid_backend_result``）；``summary`` 统计
+    ``total``/``succeeded``/``failed``/``rejected``/
+    ``no_eligible_backend``，分类之和等于作业数。每个 assigned
+    作业只调用所选后端的 executor 一次，不重试；全局并行数不超过
+    ``max_concurrency``，每个后端的并行数不超过其 slots。不修改
+    任何输入与后端返回对象。
+    """
+    normalized, valid_jobs, valid_backends = _prepare_offload_inputs(circuit, jobs, backends)
+    concurrency = _validate_concurrency(max_concurrency)
+    executor_map = _validate_executors(executors, valid_backends)
+
+    plan = _run_offload(normalized, valid_jobs, valid_backends, diagnose=False)
+
+    # 每个后端一个 slots 许可的信号量：规划已保证单后端分配数不超过
+    # slots，因此信号量永不阻塞，只是把逐后端并行上限显式化。
+    semaphores = {backend["id"]: threading.Semaphore(backend["slots"]) for backend in valid_backends}
+
+    results: list[dict | None] = [None] * len(valid_jobs)
+    counts = {"succeeded": 0, "failed": 0, "rejected": 0, "no_eligible_backend": 0}
+
+    def execute(index: int, job: dict, backend_id: str) -> tuple[int, dict]:
+        # executor 收到规范化电路与作业的独立副本，其修改不会污染
+        # 其他作业或调用方输入；返回值原样记录，不做任何写回。
+        with semaphores[backend_id]:
+            try:
+                value = executor_map[backend_id](copy.deepcopy(normalized), copy.deepcopy(job))
+            except Exception as exc:
+                return index, {
+                    "id": job["id"],
+                    "status": "failed",
+                    "backend_id": backend_id,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "code": "backend_failure",
+                        "message": str(exc),
+                    },
+                }
+        if not _is_expectation_result(value):
+            return index, {
+                "id": job["id"],
+                "status": "failed",
+                "backend_id": backend_id,
+                "error": {
+                    "type": "OffloadExecutionError",
+                    "code": "invalid_backend_result",
+                    "message": (
+                        f"executor for backend {backend_id!r} returned a value "
+                        "that is not a valid expectation result"
+                    ),
+                },
+            }
+        return index, {
+            "id": job["id"],
+            "status": "succeeded",
+            "backend_id": backend_id,
+            "result": value,
+        }
+
+    # 有界线程池：max_workers 即全局并行硬上界；结果用提交下标归位，
+    # 输出次序与完成先后无关。
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = []
+        for index, (job, plan_item) in enumerate(zip(valid_jobs, plan["results"])):
+            status = plan_item["status"]
+            if status == "assigned":
+                futures.append(pool.submit(execute, index, job, plan_item["backend_id"]))
+            else:
+                # 不执行的项保留规划详情（独立副本，不与 plan 共享对象）。
+                results[index] = copy.deepcopy(plan_item)
+                counts[status] += 1
+        for future in futures:
+            index, item = future.result()
+            results[index] = item
+            counts[item["status"]] += 1
+
+    summary = {
+        "total": len(valid_jobs),
+        "succeeded": counts["succeeded"],
+        "failed": counts["failed"],
+        "rejected": counts["rejected"],
+        "no_eligible_backend": counts["no_eligible_backend"],
+    }
+    return {"plan": plan, "results": results, "summary": summary}

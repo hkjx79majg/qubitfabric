@@ -7,7 +7,8 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
 委托给 :mod:`qubitfabric.batch`，批量期望值作业的后端卸载规划
-（只规划、不执行仿真）委托给 :mod:`qubitfabric.offload`，带 LRU 缓存与稳定请求身份的期望值
+（只规划、不执行仿真）与卸载执行（把已分配作业交给调用方提供的
+executor）委托给 :mod:`qubitfabric.offload`，带 LRU 缓存与稳定请求身份的期望值
 估计委托给 :mod:`qubitfabric.cache`，可序列化的异步参数服务器
 （参数状态创建与批量梯度更新）委托给 :mod:`qubitfabric.paramserver`，
 错误类型在本模块公开。
@@ -30,8 +31,9 @@ from .circuit import (
     simplify_circuit,
 )
 from .optimize import OptimizationError, optimize_circuit
-from .offload import OffloadPlanningError
+from .offload import OffloadExecutionError, OffloadPlanningError
 from .offload import diagnose_batch_offload as _diagnose_batch_offload
+from .offload import execute_batch_offload as _execute_batch_offload
 from .offload import plan_batch_offload as _plan_batch_offload
 from .paramserver import ParameterServerError
 from .paramserver import apply_parameter_updates as _apply_parameter_updates
@@ -59,6 +61,7 @@ __all__ = [
     "CacheStateError",
     "ParameterServerError",
     "OffloadPlanningError",
+    "OffloadExecutionError",
 ]
 
 
@@ -248,6 +251,49 @@ class Service:
         输出仅含 JSON 原生类型，不修改输入，相同输入结果完全相同。
         """
         return _diagnose_batch_offload(circuit, jobs, backends)
+
+    def execute_batch_offload(
+        self,
+        circuit: Any,
+        jobs: Any,
+        backends: Any,
+        executors: Any,
+        max_concurrency: Any = None,
+    ) -> dict:
+        """规划批量卸载并把已分配作业交给后端 executor 执行。
+
+        请求级校验顺序与异常沿用 :meth:`plan_batch_offload`（电路失败抛
+        :class:`CircuitValidationError`，backends 失败抛
+        :class:`OffloadPlanningError`，jobs 结构失败抛
+        :class:`BatchExecutionError`），请求级失败不返回部分结果。
+        ``max_concurrency`` 省略为 1，显式值必须是排除 bool 的正整数，
+        否则抛 :class:`BatchExecutionError`（code 为
+        ``invalid_concurrency``，path 为 ``max_concurrency``）。
+        ``executors`` 必须是 backend id 到可调用对象的映射，键恰好覆盖
+        全部后端 id，否则抛 :class:`OffloadExecutionError`（code 为
+        ``invalid_executors``，path 为 ``executors``）。
+
+        每个 assigned 作业把规范化电路与作业副本交给所选后端的
+        executor 调用一次，executor 返回符合 :meth:`expectation` 结果
+        形态的 JSON 对象；rejected 与 no_eligible_backend 作业不执行
+        并保留规划详情。返回 ``{"plan", "results", "summary"}``：
+        ``plan`` 与同输入调用 :meth:`plan_batch_offload` 的结果逐值
+        一致；``results`` 与 jobs 同序，成功项为 ``{"id", "status":
+        "succeeded", "backend_id", "result"}``，失败项为 ``{"id",
+        "status": "failed", "backend_id", "error"}``——executor 抛
+        异常时 error 保留原异常类型名与消息、code 为
+        ``backend_failure``，返回值非 JSON 对象或形态非法时 type 为
+        ``OffloadExecutionError``、code 为 ``invalid_backend_result``；
+        单项失败不影响其他作业，且不重试。``summary`` 统计
+        ``total``/``succeeded``/``failed``/``rejected``/
+        ``no_eligible_backend``，分类之和等于作业数。全局并行数不超过
+        ``max_concurrency``，每个后端的并行数不超过其 slots，完成先后
+        不影响结果顺序；不同合法并行度下 plan、结果顺序与汇总一致。
+        不修改输入与后端返回对象。
+        """
+        return _execute_batch_offload(
+            circuit, jobs, backends, executors, max_concurrency=max_concurrency,
+        )
 
     def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。

@@ -3,7 +3,7 @@
 from .batch import BatchExecutionError
 from .cache import CacheStateError
 from .circuit import CircuitValidationError, ParameterBindingError
-from .offload import OffloadPlanningError
+from .offload import OffloadExecutionError, OffloadPlanningError
 from .optimize import OptimizationError
 from .paramserver import ParameterServerError
 from .resources import ResourceEstimationError
@@ -24,4 +24,5 @@ __all__ = [
     "CacheStateError",
     "ParameterServerError",
     "OffloadPlanningError",
+    "OffloadExecutionError",
 ]
