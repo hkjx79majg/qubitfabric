@@ -31,6 +31,7 @@ from .circuit import (
 )
 from .optimize import OptimizationError, optimize_circuit
 from .offload import OffloadPlanningError
+from .offload import diagnose_batch_offload as _diagnose_batch_offload
 from .offload import plan_batch_offload as _plan_batch_offload
 from .paramserver import ParameterServerError
 from .paramserver import apply_parameter_updates as _apply_parameter_updates
@@ -175,6 +176,36 @@ class Service:
         含 JSON 原生类型，不修改输入。
         """
         return _plan_batch_offload(circuit, jobs, backends)
+
+    def diagnose_batch_offload(self, circuit: Any, jobs: Any, backends: Any) -> dict:
+        """只诊断、不执行仿真：规划批量作业并审计逐作业的后端选择。
+
+        输入与请求级校验顺序、异常类型/code/path 与
+        :meth:`plan_batch_offload` 完全相同（电路失败抛
+        :class:`CircuitValidationError`，backends 失败抛
+        :class:`OffloadPlanningError`，jobs 结构失败抛
+        :class:`BatchExecutionError`），请求级失败不返回部分结果，
+        单项语义失败不阻断后续作业。
+
+        返回 ``{"plan", "diagnostics"}``：``plan`` 与同输入调用
+        :meth:`plan_batch_offload` 的结果逐值一致；``diagnostics``
+        按 jobs 顺序与 plan results 一一对应。每个语义合法项含
+        ``id``、``status``、``requirements``、``selected_backend_id``
+        （成功为后端 id，否则 None）与 ``candidates``；``candidates``
+        按 backends 顺序列出全部后端的 ``backend_id``、
+        ``assigned_before``（处理该作业前已占槽位数）、``slots``、
+        ``eligible``（仅当 reasons 为空时为 true）、``reasons``
+        （``unsupported_representation``、``no_slot``、四个预算键的
+        既有顺序）与 ``budgets``（四键各给 ``required``/``limit``/
+        ``exceeded``）。``no_eligible_backend`` 项保留已计算的
+        requirements 与全部候选原因；语义无效项使用 ``rejected``，
+        requirements 与 selected_backend_id 为 null、candidates 为空，
+        并原样携带 ``validation_error``。候选记录反映逐作业推进时
+        占用前的状态，成功项也保留全部后端，调用方可按
+        assigned_before/slots 的最小负载比例与输入顺序复核选择。
+        输出仅含 JSON 原生类型，不修改输入，相同输入结果完全相同。
+        """
+        return _diagnose_batch_offload(circuit, jobs, backends)
 
     def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。

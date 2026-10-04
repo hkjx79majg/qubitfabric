@@ -12,6 +12,13 @@
 作为候选，选 ``assigned_count / slots`` 最小者（整数交叉乘法比较，
 相等时取输入靠前者）并占用一个 slot。语义无效的作业只拒绝该项，
 不阻断其他作业。不修改任何输入，输出仅含 JSON 原生类型。
+
+:func:`diagnose_batch_offload` 沿用完全相同的请求级校验与逐作业
+规划过程（因此 ``plan`` 与 :func:`plan_batch_offload` 同输入的结果
+逐值一致），但只诊断、不产生任何额外副作用，并额外返回按 jobs
+顺序排列的 ``diagnostics``：每个后端在处理该作业前的已占槽位数、
+slot 总量、是否候选、不适用原因与四项预算的 required/limit/exceeded
+快照，使调用方可以复核每次选择。
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ from .simulate import (
     _validate_shots,
 )
 
-__all__ = ["OffloadPlanningError", "plan_batch_offload"]
+__all__ = ["OffloadPlanningError", "plan_batch_offload", "diagnose_batch_offload"]
 
 _BYTES_PER_ELEMENT = 16
 _MAX_QUBITS_STATE_VECTOR = 20
@@ -249,26 +256,66 @@ def _backend_reasons(backend: dict, assigned_count: int, requirements: dict) -> 
     return reasons
 
 
-def plan_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
-    """把批量期望值作业规划分配到后端，不执行任何仿真，不修改输入。
-
-    返回 ``{"results", "summary"}``：results 按 jobs 输入顺序排列，
-    成功项为 ``{"id", "status": "assigned", "backend_id",
-    "requirements"}``，语义无效项为 ``{"id", "status": "rejected",
-    "requirements": None, "validation_error"}``，无候选后端时为
-    ``{"id", "status": "no_eligible_backend", "requirements": None,
-    "reasons"}``；summary 给出每个后端的分配数 ``backend_assignments``
-    （按后端输入顺序）以及 ``total``/``assigned``/``rejected``。
-    请求级失败（电路/backends/jobs 结构）直接抛异常，不返回部分计划。
-    """
+def _prepare_offload_inputs(circuit: Any, jobs: Any, backends: Any) -> tuple[dict, list[dict], list[dict]]:
+    """两个公共入口共用的请求级校验：电路 → backends → jobs 结构。"""
     normalized = normalize_circuit(circuit)
     valid_backends = _validate_backends(backends)
     valid_jobs = _validate_jobs(jobs)
+    return normalized, valid_jobs, valid_backends
 
+
+def _validation_error(exc: Exception) -> dict:
+    """把单项语义异常转写为 rejected 项携带的稳定错误对象。"""
+    return {
+        "type": type(exc).__name__,
+        "code": exc.code,
+        "path": exc.path,
+        "message": str(exc),
+    }
+
+
+def _public_requirements(requirements: dict) -> dict:
+    """复制一份仅含公开资源键的需求对象。"""
+    return {
+        "representation": requirements["representation"],
+        "state_bytes": requirements["state_bytes"],
+        "circuit_evaluations": requirements["circuit_evaluations"],
+        "gate_applications": requirements["gate_applications"],
+        "total_shots": requirements["total_shots"],
+    }
+
+
+def _candidate_budgets(backend: dict, requirements: dict) -> dict:
+    """四个预算键各自的 required/limit/exceeded 快照（按规范键序）。"""
+    budgets: dict[str, dict] = {}
+    for budget_key in _BUDGET_KEYS:
+        required = requirements[_REQUIREMENT_KEYS[budget_key]]
+        limit = backend[budget_key]
+        budgets[budget_key] = {
+            "required": required,
+            "limit": limit,
+            "exceeded": required > limit,
+        }
+    return budgets
+
+
+def _run_offload(
+    normalized: dict,
+    valid_jobs: list[dict],
+    valid_backends: list[dict],
+    diagnose: bool,
+) -> dict:
+    """逐作业规划核心；``diagnose`` 为真时额外记录候选审计快照。
+
+    无论是否诊断，选择与计数逻辑完全一致，因此同输入的规划结果逐值
+    相同。候选快照在选择循环内、占用 slot 之前记录，反映处理该作业
+    之前的逐后端状态。
+    """
     # 内部计数载体独立于输入对象，绝不写回入参后端。
     assigned_counts = [0] * len(valid_backends)
 
     results: list[dict] = []
+    diagnostics: list[dict] = []
     assigned = 0
     rejected = 0
 
@@ -277,26 +324,25 @@ def plan_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
             requirements = _job_requirements(normalized, job)
         except (CircuitValidationError, ParameterBindingError, SimulationError) as exc:
             rejected += 1
+            error = _validation_error(exc)
             results.append({
                 "id": job["id"],
                 "status": "rejected",
                 "requirements": None,
-                "validation_error": {
-                    "type": type(exc).__name__,
-                    "code": exc.code,
-                    "path": exc.path,
-                    "message": str(exc),
-                },
+                "validation_error": error,
             })
+            if diagnose:
+                diagnostics.append({
+                    "id": job["id"],
+                    "status": "rejected",
+                    "requirements": None,
+                    "selected_backend_id": None,
+                    "candidates": [],
+                    "validation_error": error,
+                })
             continue
 
-        req_public = {
-            "representation": requirements["representation"],
-            "state_bytes": requirements["state_bytes"],
-            "circuit_evaluations": requirements["circuit_evaluations"],
-            "gate_applications": requirements["gate_applications"],
-            "total_shots": requirements["total_shots"],
-        }
+        req_public = _public_requirements(requirements)
 
         chosen = -1
         # 候选比例 assigned_count/slots 的最小者；交叉乘法 a/b < c/d
@@ -304,12 +350,23 @@ def plan_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
         best_num = 0
         best_den = 1
         all_reasons: list[list[str]] = []
+        candidates: list[dict] = []
         for i, backend in enumerate(valid_backends):
-            reasons = _backend_reasons(backend, assigned_counts[i], requirements)
+            assigned_before = assigned_counts[i]
+            reasons = _backend_reasons(backend, assigned_before, requirements)
             all_reasons.append(reasons)
+            if diagnose:
+                candidates.append({
+                    "backend_id": backend["id"],
+                    "assigned_before": assigned_before,
+                    "slots": backend["slots"],
+                    "eligible": not reasons,
+                    "reasons": reasons,
+                    "budgets": _candidate_budgets(backend, requirements),
+                })
             if reasons:
                 continue
-            num = assigned_counts[i]
+            num = assigned_before
             den = backend["slots"]
             if chosen == -1 or num * best_den < best_num * den:
                 chosen = i
@@ -324,26 +381,95 @@ def plan_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
                 "requirements": None,
                 "reasons": all_reasons,
             })
+            if diagnose:
+                diagnostics.append({
+                    "id": job["id"],
+                    "status": "no_eligible_backend",
+                    "requirements": req_public,
+                    "selected_backend_id": None,
+                    "candidates": candidates,
+                })
             continue
 
         assigned_counts[chosen] += 1
         assigned += 1
+        backend_id = valid_backends[chosen]["id"]
         results.append({
             "id": job["id"],
             "status": "assigned",
-            "backend_id": valid_backends[chosen]["id"],
+            "backend_id": backend_id,
             "requirements": req_public,
         })
+        if diagnose:
+            diagnostics.append({
+                "id": job["id"],
+                "status": "assigned",
+                "requirements": req_public,
+                "selected_backend_id": backend_id,
+                "candidates": candidates,
+            })
 
-    return {
-        "results": results,
-        "summary": {
-            "backend_assignments": [
-                {"backend_id": backend["id"], "assigned": count}
-                for backend, count in zip(valid_backends, assigned_counts)
-            ],
-            "total": len(valid_jobs),
-            "assigned": assigned,
-            "rejected": rejected,
-        },
+    summary = {
+        "backend_assignments": [
+            {"backend_id": backend["id"], "assigned": count}
+            for backend, count in zip(valid_backends, assigned_counts)
+        ],
+        "total": len(valid_jobs),
+        "assigned": assigned,
+        "rejected": rejected,
     }
+    plan = {"results": results, "summary": summary}
+    if diagnose:
+        return {"plan": plan, "diagnostics": diagnostics}
+    return plan
+
+
+def plan_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
+    """把批量期望值作业规划分配到后端，不执行任何仿真，不修改输入。
+
+    返回 ``{"results", "summary"}``：results 按 jobs 输入顺序排列，
+    成功项为 ``{"id", "status": "assigned", "backend_id",
+    "requirements"}``，语义无效项为 ``{"id", "status": "rejected",
+    "requirements": None, "validation_error"}``，无候选后端时为
+    ``{"id", "status": "no_eligible_backend", "requirements": None,
+    "reasons"}``；summary 给出每个后端的分配数 ``backend_assignments``
+    （按后端输入顺序）以及 ``total``/``assigned``/``rejected``。
+    请求级失败（电路/backends/jobs 结构）直接抛异常，不返回部分计划。
+    """
+    normalized, valid_jobs, valid_backends = _prepare_offload_inputs(circuit, jobs, backends)
+    return _run_offload(normalized, valid_jobs, valid_backends, diagnose=False)
+
+
+def diagnose_batch_offload(circuit: Any, jobs: Any, backends: Any) -> dict:
+    """只诊断、不执行仿真：规划批量作业并审计逐作业的后端选择过程。
+
+    输入、请求级校验顺序与异常（电路
+    :class:`qubitfabric.circuit.CircuitValidationError`、backends
+    :class:`OffloadPlanningError`、jobs 结构
+    :class:`qubitfabric.batch.BatchExecutionError`）与
+    :func:`plan_batch_offload` 完全相同，请求级失败不返回部分结果。
+
+    返回 ``{"plan", "diagnostics"}``：``plan`` 与同输入直接调用
+    :func:`plan_batch_offload` 的结果逐值一致（字段、顺序、值）；
+    ``diagnostics`` 按 jobs 输入顺序与 plan results 一一对应。每个
+    语义合法项（``assigned`` / ``no_eligible_backend``）含 ``id``、
+    ``status``、``requirements``、``selected_backend_id`` 与
+    ``candidates``：成功分配时 ``selected_backend_id`` 为后端 id，
+    否则为 None；``candidates`` 按 backends 顺序列出**全部**后端，
+    每项含 ``backend_id``、``assigned_before``（处理该作业前该后端
+    已占槽位数）、``slots``、``eligible``（仅当 reasons 为空时为
+    true）、``reasons``（沿用 ``unsupported_representation``、
+    ``no_slot`` 与四个预算键的既有顺序）与 ``budgets``（四个预算键
+    各给 ``required``/``limit``/``exceeded``，按
+    ``max_state_bytes`` / ``max_circuit_evaluations`` /
+    ``max_gate_applications`` / ``max_total_shots`` 顺序）。
+    ``no_eligible_backend`` 项保留已计算的 ``requirements`` 与全部
+    候选原因。语义无效项使用 ``rejected``：``requirements`` 与
+    ``selected_backend_id`` 为 None、``candidates`` 为空，并原样
+    携带与规划结果一致的 ``validation_error``；单项失败不阻断后续
+    作业。候选快照反映逐作业推进时（占用 slot 之前）的状态，调用
+    方可按 assigned_before/slots 的最小负载比例与输入顺序复核选择。
+    输出仅含 JSON 原生类型，不修改输入，相同输入结果完全相同。
+    """
+    normalized, valid_jobs, valid_backends = _prepare_offload_inputs(circuit, jobs, backends)
+    return _run_offload(normalized, valid_jobs, valid_backends, diagnose=True)
