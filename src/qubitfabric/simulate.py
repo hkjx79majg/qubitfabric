@@ -30,7 +30,12 @@ from typing import Any
 
 from .circuit import bind_parameters, normalize_circuit
 
-__all__ = ["SimulationError", "estimate_expectation", "estimate_gradient"]
+__all__ = [
+    "SimulationError",
+    "estimate_expectation",
+    "estimate_grouped_hamiltonian",
+    "estimate_gradient",
+]
 
 _MAX_QUBITS = 20
 _MAX_QUBITS_NOISY = 10
@@ -515,6 +520,265 @@ def estimate_expectation(
             })
 
     return {"qubit_count": qubit_count, "shots": shot_count, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# 共享采样预算的 Hamiltonian 联合估计
+# ---------------------------------------------------------------------------
+#
+# terms 沿用优化入口的 observable 与有限 coefficient，按输入顺序贪心分组：
+# 每项放入最早的兼容组，两个 Pauli 串仅当每个量子位上的字符相同或至少
+# 一方为 I 时兼容。每组只生成一批联合测量样本：测量前把 X/Y 位旋转到
+# Z 基，同组各项从相同 bitstring 计算 ±1 本征值。总 shots 在各组间均分
+# （余数依组序各加一），各组的采样 RNG 按 ``f"{seed}:group:{index}"``
+# 独立派生，互不干扰。
+
+
+def _compatible(basis: list[str], observable: str) -> bool:
+    """observable 是否与组内已有 basis 兼容。
+
+    每个量子位上字符相同或至少一方为 I 才兼容；basis 中尚无测量字符
+    （``""`` 占位）的位置视为 I。
+    """
+    for q, ch in enumerate(observable):
+        if ch != "I" and basis[q] != "" and basis[q] != ch:
+            return False
+    return True
+
+
+def _group_pauli_strings(
+    observables: list[str],
+) -> tuple[list[list[str]], list[list[int]], list[list[int]]]:
+    """按输入顺序贪心分组，返回 ``(bases, member_indexes, measure_qubits)``。
+
+    每项放入最早的兼容组，无兼容组时新建；组 basis 为各位唯一的非 I
+    字符，没有非 I 字符的位置保留 I；``measure_qubits`` 给出各组需要
+    旋转到 Z 基并读取的量子位（按编号升序）。
+    """
+    bases: list[list[str]] = []
+    members: list[list[int]] = []
+    for index, observable in enumerate(observables):
+        for g, basis in enumerate(bases):
+            if _compatible(basis, observable):
+                for q, ch in enumerate(observable):
+                    if ch != "I":
+                        basis[q] = ch
+                members[g].append(index)
+                break
+        else:
+            basis = [ch if ch != "I" else "" for ch in observable]
+            bases.append(basis)
+            members.append([index])
+
+    basis_strings = ["".join(ch if ch != "" else "I" for ch in basis) for basis in bases]
+    measure_qubits = [[q for q, ch in enumerate(basis) if ch != ""] for basis in bases]
+    return basis_strings, members, measure_qubits
+
+
+def _apply_basis_rotation(state: list[complex], size: int, basis: str) -> None:
+    """在状态向量上把 basis 的 X/Y 位旋转到 Z 基，原地修改。
+
+    X 测量前作用 H；Y 测量前作用 rz(-π/2)（即 S†，全局相位无关）再
+    作用 H，使随后的 Z 基测量复现原 Pauli 的 ±1 本征值；I/Z 位不动。
+    """
+    for q, ch in enumerate(basis):
+        if ch == "X":
+            _apply_h(state, size, q)
+        elif ch == "Y":
+            _apply_rz(state, size, q, -math.pi / 2.0)
+            _apply_h(state, size, q)
+
+
+def _dm_apply_basis_rotation(rho: list[complex], size: int, basis: str) -> None:
+    """密度矩阵版本的基旋转，原地把 X/Y 位转到 Z 基。"""
+    for q, ch in enumerate(basis):
+        if ch == "X":
+            _dm_apply_single(rho, size, q, _INV_SQRT2, _INV_SQRT2, _INV_SQRT2, -_INV_SQRT2)
+        elif ch == "Y":
+            half = -math.pi / 4.0
+            lo = complex(math.cos(half), -math.sin(half))
+            hi = complex(math.cos(half), math.sin(half))
+            _dm_apply_single(rho, size, q, lo, 0j, 0j, hi)
+            _dm_apply_single(rho, size, q, _INV_SQRT2, _INV_SQRT2, _INV_SQRT2, -_INV_SQRT2)
+
+
+def _diagonal_probabilities(
+    amplitudes: Any, size: int, measured: list[int], density_matrix: bool = False,
+) -> list[float]:
+    """提取 measured 量子位的计算基测量边缘概率。
+
+    ``amplitudes`` 为状态向量（取模平方）或已旋转到测量基的密度矩阵
+    （取对角元，由 ``density_matrix`` 区分）；结果按 measured 量子位
+    构成的位串索引（measured[0] 为最高位），长度为
+    ``2 ** len(measured)``；没有测量位时唯一空串概率恒为 1。
+    """
+    width = len(measured)
+    probabilities = [0.0] * (1 << width)
+    if width == 0:
+        probabilities[0] = 1.0
+        return probabilities
+    masks = [1 << q for q in measured]
+    for b in range(size):
+        outcome = 0
+        for k, mask in enumerate(masks):
+            if b & mask:
+                outcome |= 1 << (width - 1 - k)
+        if density_matrix:
+            probabilities[outcome] += amplitudes[b * size + b].real
+        else:
+            amp = amplitudes[b]
+            probabilities[outcome] += amp.real * amp.real + amp.imag * amp.imag
+    return probabilities
+
+
+def _sample_group_bitstrings(
+    probabilities: list[float], shots: int, seed: int, group_index: int,
+) -> list[int]:
+    """为一个组抽取一批联合测量样本，返回 measured 位串构成的整数列表。"""
+    rng = random.Random(f"{seed}:group:{group_index}")
+    outcomes: list[int] = []
+    count = len(probabilities)
+    for _ in range(shots):
+        point = rng.random()
+        cumulative = 0.0
+        outcome = count - 1
+        for k in range(count):
+            cumulative += probabilities[k]
+            if point < cumulative:
+                outcome = k
+                break
+        outcomes.append(outcome)
+    return outcomes
+
+
+def estimate_grouped_hamiltonian(
+    circuit: Any,
+    terms: Any,
+    values: Any = None,
+    shots: Any = None,
+    seed: Any = None,
+    noise: Any = None,
+) -> dict:
+    """用一个总采样预算联合估计 Hamiltonian 的各项期望值，不修改输入。
+
+    terms 沿用优化入口的结构（Pauli ``observable`` 加有限实数
+    ``coefficient``），按输入顺序贪心分组，兼容的 Pauli 串共享同一批
+    联合测量样本。``shots`` 是所有组共享的总预算，按整除结果均分，
+    余数依组序各加一；小于分组数时抛 ``insufficient_shots``。
+
+    校验顺序：电路规范化/参数绑定 → terms 结构 → observable 内容 →
+    noise → shots → seed；状态空间上限在仿真前检查。返回
+    ``{"qubit_count", "shots", "groups", "results", "energy"}``：
+    groups 按确定的组序给出 ``{"basis", "shots", "term_indexes"}``；
+    results 与 terms 一一对应（保留重复项），每项为
+    ``{"observable", "coefficient", "expectation", "plus_count",
+    "minus_count"}``；energy 为 coefficient×expectation 按输入顺序之和。
+    """
+    normalized = normalize_circuit(circuit)
+    bound = bind_parameters(normalized, {} if values is None else values)
+    qubit_count = bound["qubit_count"]
+
+    # terms 结构校验沿用优化入口（抛 OptimizationError）；延迟导入避开
+    # optimize → simulate 的模块级循环依赖。
+    from .optimize import _validate_terms
+    observables, coefficients = _validate_terms(terms)
+    _validate_observables(observables, qubit_count)
+    p1, p2 = _validate_noise(noise)
+    bases, members, measured = _group_pauli_strings(observables)
+    group_count = len(bases)
+    shot_count = _validate_total_shots(shots, group_count)
+    resolved_seed = _validate_grouped_seed(seed)
+
+    noisy = p1 != 0.0 or p2 != 0.0
+    max_qubits = _MAX_QUBITS_NOISY if noisy else _MAX_QUBITS
+    if qubit_count > max_qubits:
+        raise SimulationError(
+            "state_space_too_large", "qubit_count",
+            f"qubit_count {qubit_count} exceeds the {max_qubits}-qubit simulation limit",
+        )
+
+    size = 1 << qubit_count
+    base, remainder = divmod(shot_count, group_count)
+    group_shots = [base + (1 if g < remainder else 0) for g in range(group_count)]
+    plus_counts = [0] * len(observables)
+    minus_counts = [0] * len(observables)
+
+    for g in range(group_count):
+        basis = bases[g]
+        if noisy:
+            amplitudes: Any = _simulate_noisy(bound, p1, p2)
+            _dm_apply_basis_rotation(amplitudes, size, basis)
+            probabilities = _diagonal_probabilities(amplitudes, size, measured[g], True)
+        else:
+            amplitudes = _simulate(bound)
+            _apply_basis_rotation(amplitudes, size, basis)
+            probabilities = _diagonal_probabilities(amplitudes, size, measured[g])
+        samples = _sample_group_bitstrings(probabilities, group_shots[g], resolved_seed, g)
+
+        width = len(measured[g])
+        bit_position = {q: width - 1 - k for k, q in enumerate(measured[g])}
+        for term_index in members[g]:
+            observable = observables[term_index]
+            if not any(ch != "I" for ch in observable):
+                plus_counts[term_index] = group_shots[g]
+                continue
+            plus = 0
+            for sample in samples:
+                parity = 0
+                for q, ch in enumerate(observable):
+                    if ch != "I" and ((sample >> bit_position[q]) & 1):
+                        parity ^= 1
+                if parity == 0:
+                    plus += 1
+            plus_counts[term_index] = plus
+            minus_counts[term_index] = group_shots[g] - plus
+
+    results: list[dict] = []
+    energy = 0.0
+    for k, observable in enumerate(observables):
+        total = plus_counts[k] + minus_counts[k]
+        expectation = _canon_float((plus_counts[k] - minus_counts[k]) / total)
+        energy += coefficients[k] * expectation
+        results.append({
+            "observable": observable,
+            "coefficient": coefficients[k],
+            "expectation": expectation,
+            "plus_count": plus_counts[k],
+            "minus_count": minus_counts[k],
+        })
+
+    groups = [
+        {"basis": bases[g], "shots": group_shots[g], "term_indexes": members[g]}
+        for g in range(group_count)
+    ]
+    return {
+        "qubit_count": qubit_count,
+        "shots": shot_count,
+        "groups": groups,
+        "results": results,
+        "energy": _canon_float(energy),
+    }
+
+
+def _validate_total_shots(shots: Any, group_count: int) -> int:
+    """校验总采样预算：必须是排除 bool 的正整数且不小于分组数。"""
+    if not _is_int(shots) or shots <= 0:
+        raise SimulationError("invalid_shots", "shots", "shots must be a positive integer")
+    if shots < group_count:
+        raise SimulationError(
+            "insufficient_shots", "shots",
+            f"shots {shots} cannot cover {group_count} measurement groups",
+        )
+    return shots
+
+
+def _validate_grouped_seed(seed: Any) -> int:
+    """seed 省略为 0；显式值必须是排除 bool 的非负整数。"""
+    if seed is None:
+        return 0
+    if not _is_int(seed) or seed < 0:
+        raise SimulationError("invalid_seed", "seed", "seed must be a non-negative integer")
+    return seed
 
 
 # ---------------------------------------------------------------------------

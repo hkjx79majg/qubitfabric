@@ -40,7 +40,12 @@ from .resources import ResourceEstimationError
 from .resources import estimate_resources as _estimate_resources
 from .resumable import RuntimeStateError
 from .resumable import optimize_resumable as _optimize_resumable
-from .simulate import SimulationError, estimate_expectation, estimate_gradient
+from .simulate import (
+    SimulationError,
+    estimate_expectation,
+    estimate_gradient,
+    estimate_grouped_hamiltonian,
+)
 
 __all__ = [
     "Service",
@@ -98,6 +103,43 @@ class Service:
         """
         return estimate_expectation(
             circuit, observables, values=values, shots=shots, seed=seed, noise=noise,
+        )
+
+    def grouped_hamiltonian_expectation(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any = None,
+        shots: Any = None,
+        seed: Any = None,
+        noise: Any = None,
+    ) -> dict:
+        """用一个总采样预算联合估计 Hamiltonian 的各项期望值。
+
+        输入电路、完整参数绑定与逐门退极化噪声语义与 :meth:`expectation`
+        一致；``terms`` 沿用 :meth:`optimize` 的 Hamiltonian 项结构
+        （Pauli ``observable`` 加有限实数 ``coefficient``），按输入顺序
+        贪心分组——每项放入最早的兼容组，两个 Pauli 串仅当每个量子位上
+        字符相同或至少一方为 I 时兼容。``shots`` 为排除 bool 的正整数，
+        是所有组共享的总预算：按整除结果均分，余数依组顺序各加一；小于
+        分组数时抛 :class:`SimulationError`（code 为
+        ``insufficient_shots``，path 为 ``shots``）。``seed`` 省略为 0，
+        各组随机流按 seed 与组序号隔离，相同规范化输入与 seed 逐值一致。
+
+        每组只生成一批联合测量样本，同组各项从相同 bitstring 计算 ±1
+        本征值，纯 I 项恒为 +1。返回 ``{"qubit_count", "shots",
+        "groups", "results", "energy"}``：groups 按确定顺序排列，每组含
+        ``basis``/``shots``/``term_indexes``；results 与 terms 一一对应
+        （保留重复项），每项含 ``observable``/``coefficient``/
+        ``expectation``/``plus_count``/``minus_count``，计数之和等于所属
+        组 shots；energy 为 coefficient×expectation 按输入顺序之和。
+        校验顺序为电路、绑定、terms、observable、noise、shots、seed；
+        terms 结构错误沿用 :class:`OptimizationError`，其余复用现有异常
+        类型、code 与 path。零噪声与省略 noise 等价，不修改输入，输出
+        只含 JSON 原生类型。
+        """
+        return estimate_grouped_hamiltonian(
+            circuit, terms, values=values, shots=shots, seed=seed, noise=noise,
         )
 
     def cached_expectation(
