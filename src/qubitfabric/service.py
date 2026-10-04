@@ -6,7 +6,8 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 确定性变分优化委托给 :mod:`qubitfabric.optimize`，可暂停续算的优化
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
-委托给 :mod:`qubitfabric.batch`，批量期望值作业的后端卸载规划
+委托给 :mod:`qubitfabric.batch`，共享总采样预算的 Hamiltonian 分组
+联合采样委托给 :mod:`qubitfabric.grouped`，批量期望值作业的后端卸载规划
 （只规划、不执行仿真）委托给 :mod:`qubitfabric.offload`，带 LRU 缓存与稳定请求身份的期望值
 估计委托给 :mod:`qubitfabric.cache`，可序列化的异步参数服务器
 （参数状态创建与批量梯度更新）委托给 :mod:`qubitfabric.paramserver`，
@@ -29,6 +30,7 @@ from .circuit import (
     normalize_circuit,
     simplify_circuit,
 )
+from .grouped import grouped_hamiltonian_expectation as _grouped_hamiltonian_expectation
 from .optimize import OptimizationError, optimize_circuit
 from .offload import OffloadPlanningError
 from .offload import diagnose_batch_offload as _diagnose_batch_offload
@@ -216,6 +218,36 @@ class Service:
         可选 ``noise`` 描述逐门局部退极化噪声，省略时行为不变。
         """
         return estimate_gradient(circuit, observables, values=values, noise=noise)
+
+    def grouped_hamiltonian_expectation(
+        self,
+        circuit: Any,
+        terms: Any,
+        values: Any = None,
+        shots: Any = None,
+        seed: Any = None,
+        noise: Any = None,
+    ) -> dict:
+        """用一个总采样预算联合估计 Hamiltonian 各项期望值。
+
+        ``terms`` 沿用 :meth:`optimize` 的 Hamiltonian 项结构（Pauli
+        ``observable`` 与有限 ``coefficient``）；``shots`` 为排除 bool
+        的正整数总预算，``seed`` 可选。按 terms 输入顺序把各项放入最早
+        的兼容组（逐位字符相同或至少一方为 ``I``），组 basis 取各位唯一
+        的非 ``I`` 字符；预算按整除均分，余数依组顺序各加一，``shots``
+        小于分组数时抛 :class:`SimulationError`（code 为
+        ``insufficient_shots``，path 为 ``shots``）。每组只生成一批联合
+        测量样本，同组各项从相同 bitstring 计算 ±1 本征值；各组随机流
+        由 seed 与组序号隔离，相同规范化输入与 seed 的结果逐值一致。
+        返回 ``{"qubit_count", "shots", "groups", "results", "energy"}``，
+        results 与 terms 一一对应且保留重复项，各项计数之和等于所属组
+        shots，纯 ``I`` 项恒为 +1。校验顺序为电路、绑定、terms、
+        observable、noise、shots、seed，除预算不足外复用现有异常类型、
+        code 与 path。不修改输入，输出仅含 JSON 原生类型。
+        """
+        return _grouped_hamiltonian_expectation(
+            circuit, terms, values=values, shots=shots, seed=seed, noise=noise,
+        )
 
     def optimize(
         self,
