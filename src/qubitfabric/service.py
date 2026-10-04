@@ -7,7 +7,7 @@ Pauli 期望值估计与参数移位梯度委托给 :mod:`qubitfabric.simulate`�
 委托给 :mod:`qubitfabric.resumable`，不执行计算的资源预算准入估计
 委托给 :mod:`qubitfabric.resources`，同一电路上多作业的批量期望值
 委托给 :mod:`qubitfabric.batch`，批量期望值作业的后端卸载规划
-（只规划、不执行仿真）委托给 :mod:`qubitfabric.offload`，带 LRU 缓存与稳定请求身份的期望值
+（只规划、不执行仿真）及其逐作业选择诊断委托给 :mod:`qubitfabric.offload`，带 LRU 缓存与稳定请求身份的期望值
 估计委托给 :mod:`qubitfabric.cache`，可序列化的异步参数服务器
 （参数状态创建与批量梯度更新）委托给 :mod:`qubitfabric.paramserver`，
 错误类型在本模块公开。
@@ -31,6 +31,7 @@ from .circuit import (
 )
 from .optimize import OptimizationError, optimize_circuit
 from .offload import OffloadPlanningError
+from .offload import diagnose_batch_offload as _diagnose_batch_offload
 from .offload import plan_batch_offload as _plan_batch_offload
 from .paramserver import ParameterServerError
 from .paramserver import apply_parameter_updates as _apply_parameter_updates
@@ -175,6 +176,31 @@ class Service:
         含 JSON 原生类型，不修改输入。
         """
         return _plan_batch_offload(circuit, jobs, backends)
+
+    def diagnose_batch_offload(self, circuit: Any, jobs: Any, backends: Any) -> dict:
+        """只诊断、不执行仿真：审计 :meth:`plan_batch_offload` 的选择过程。
+
+        规划输入（电路、jobs、backends）与请求级校验顺序、异常类型/code/
+        path 和 :meth:`plan_batch_offload` 完全相同（电路 → backends →
+        jobs 结构），请求级失败不返回部分结果；单项语义失败只拒绝该项，
+        不阻断后续作业。返回 ``{"plan", "diagnostics"}``：``plan`` 与
+        同一输入调用 :meth:`plan_batch_offload` 的结果逐值一致；
+        ``diagnostics`` 按 jobs 顺序排列，每个语义合法项含 ``id``、
+        ``status``、``requirements``、``selected_backend_id``（成功时
+        为后端 id，否则为 null）与 ``candidates``。``candidates`` 按
+        backends 顺序列出每个后端的 ``backend_id``、``assigned_before``
+        （处理该作业前的已占槽位数）、``slots``、``eligible``（仅当
+        reasons 为空时为 true）、``reasons``（沿用
+        ``unsupported_representation``、``no_slot`` 与四个预算键的既有
+        顺序）与 ``budgets``（四个预算键各给 required/limit/exceeded）。
+        候选记录反映逐作业推进时的状态，成功项也保留全部后端，调用方可
+        按 assigned_before/slots 的既有最小负载比例与输入顺序复核选择；
+        ``no_eligible_backend`` 项保留已计算的 requirements 与全部候选
+        原因。语义无效项使用 ``rejected``，requirements 与
+        selected_backend_id 为 null、candidates 为空，并原样携带现有
+        ``validation_error``。输出只含 JSON 原生类型，不修改输入。
+        """
+        return _diagnose_batch_offload(circuit, jobs, backends)
 
     def gradient(self, circuit: Any, observables: Any, values: Any = None, noise: Any = None) -> dict:
         """精确参数移位梯度：各 observable 对全部声明参数的导数。
